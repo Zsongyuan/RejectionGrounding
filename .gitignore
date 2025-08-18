@@ -5,7 +5,30 @@ __pycache__/
 
 # C extensions
 *.so
-
+roberta-base/
+pointnet2/
+ScanRefer/
+backup/
+build_scene/
+checkpoints/
+data/
+log/
+output/
+sng_parser/
+tensorboard_output/
+TN_Sample/
+tns/
+ViGiL3D/
+*.pkl
+*.gz
+*.txt
+*.json
+*.tsv
+*.ply
+*_tsp.py
+*.pyc
+*.patch
+*.0
 # Distribution / packaging
 .Python
 build/
