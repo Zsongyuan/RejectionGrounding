@@ -10,6 +10,7 @@ from mmdet3d.structures.bbox_3d import rotation_3d_in_axis
 from .axis_aligned_iou_loss import AxisAlignedIoULoss2
 from mmdet.models.losses import FocalLoss
 from .trans_modules import (BiEncoder, BiEncoderLayer, PositionEmbeddingLearned)
+from .modules import MLP
 
 import pdb
 import logging
@@ -72,7 +73,9 @@ class TSPHead(nn.Module):
                  train_cfg=None,
                  test_cfg=dict(nms_pre=1, iou_thr=.5, score_thr=.01),
                  keep_loss_weight = 1.0,
-                 bbox_loss_weight = 1.0):
+                 bbox_loss_weight = 1.0,
+                 enable_reject_head=False,
+                 reject_thresh=0.6):
         super(TSPHead, self).__init__()
         self.voxel_size = voxel_size
         self.pts_prune_threshold = pts_prune_threshold
@@ -94,6 +97,10 @@ class TSPHead(nn.Module):
         self.com_threshold = com_threshold
         self.random_prune_threshold = (1200,4000)
         self._init_layers(in_channels, out_channels, n_reg_outs, n_classes)
+        self.enable_reject_head = enable_reject_head
+        self.reject_thresh = reject_thresh
+        if self.enable_reject_head:
+            self.reject_head = MLP(256, [128, 1], b_norm=False)
 
 
     @staticmethod
@@ -386,8 +393,11 @@ class TSPHead(nn.Module):
             if i == 0:
                 out = self.__getattr__(f'out_block_{i}')(x)
         out = self.fuse(out, text_feats[:, 0])
+        vis_pool = torch.stack([out.features[perm].mean(0) for perm in out.decomposition_permutations])
+        text_valid = ~text_attention_mask
+        text_pool = (text_feats * text_valid.unsqueeze(-1)).sum(1) / text_valid.sum(1, keepdim=True).clamp(min=1)
         bbox_pred, cls_pred, point = self._forward_single(out)
-        return [bbox_pred], [cls_pred], [point], keep_preds[::-1], keep_gts[::-1], bboxes_level, com_pred_training, com_coords_training
+        return [bbox_pred], [cls_pred], [point], keep_preds[::-1], keep_gts[::-1], bboxes_level, com_pred_training, com_coords_training, vis_pool, text_pool
     
 
     def _prune_inference(self, x, scores, layer_id):
@@ -658,20 +668,49 @@ class TSPHead(nn.Module):
             pos_masks.append(pos_mask)
             pos_masks_com.append(pos_mask_com)
 
+        device = cls_losses[0].device if len(cls_losses) > 0 else bbox_losses[0].device
+        dtype = cls_losses[0].dtype if len(cls_losses) > 0 else bbox_losses[0].dtype
+
+        if len(bbox_losses) > 0:
+            bbox_loss = torch.mean(torch.cat(bbox_losses))
+        else:
+            bbox_loss = torch.zeros(1, device=device, dtype=dtype)
+
+        if len(cls_losses) > 0:
+            cls_loss = torch.sum(torch.cat(cls_losses))
+        else:
+            cls_loss = torch.zeros(1, device=device, dtype=dtype)
+        cls_denom = torch.sum(torch.cat(pos_masks)) if len(pos_masks) > 0 else torch.zeros(1, device=device, dtype=dtype)
+        cls_loss = cls_loss / cls_denom.clamp(min=1)
+
+        if len(com_losses) > 0:
+            com_loss = torch.sum(torch.cat(com_losses))
+        else:
+            com_loss = torch.zeros(1, device=device, dtype=dtype)
+        com_denom = torch.sum(torch.cat(pos_masks_com)) if len(pos_masks_com) > 0 else torch.zeros(1, device=device, dtype=dtype)
+        com_loss = com_loss / com_denom.clamp(min=1)
+
         return dict(
-            bbox_loss=self.bbox_loss_weight * torch.mean(torch.cat(bbox_losses)),
-            cls_loss=torch.sum(torch.cat(cls_losses)) / torch.sum(torch.cat(pos_masks)),
+            bbox_loss=self.bbox_loss_weight * bbox_loss,
+            cls_loss=cls_loss,
             keep_loss=self.keep_loss_weight * keep_losses / len(img_metas),
-            com_loss=torch.sum(torch.cat(com_losses)) / torch.sum(torch.cat(pos_masks_com))) 
+            com_loss=com_loss)
 
 
     def forward_train(self, x, text_feats, text_attention_mask, gt_bboxes, gt_labels, gt_all_bbox_new, auxi_bbox, img_metas,pc=None):
-        bbox_preds, cls_preds, points, keep_preds, keep_gts, bboxes_level, com_pred_training, com_coords_training = \
+        (bbox_preds, cls_preds, points, keep_preds, keep_gts, bboxes_level,
+         com_pred_training, com_coords_training, vis_pool, text_pool) = \
             self(x, text_feats, text_attention_mask, gt_bboxes, gt_labels, gt_all_bbox_new, auxi_bbox, img_metas,pc)
 
-        return self._loss(bbox_preds, cls_preds, points,
-                          gt_bboxes, gt_labels, img_metas, keep_preds, keep_gts, bboxes_level,
-                          com_pred_training, com_coords_training)
+        losses = self._loss(bbox_preds, cls_preds, points,
+                             gt_bboxes, gt_labels, img_metas, keep_preds, keep_gts, bboxes_level,
+                             com_pred_training, com_coords_training)
+        if self.enable_reject_head:
+            reject_feat = torch.cat([vis_pool, text_pool], dim=1)
+            reject_logit = self.reject_head(reject_feat)
+            losses['reject_logit'] = reject_logit
+            losses['reject_prob'] = reject_logit.sigmoid()
+        return losses
 
 
     def _nms(self, bboxes, scores, img_meta):
@@ -901,10 +940,30 @@ class TSPHead(nn.Module):
                 out = self.__getattr__(f'out_block_{i}')(x)
         start_time = time.time()
         out = self.fuse(out, text_feats[:, 0])
+        vis_pool = torch.stack([out.features[perm].mean(0) for perm in out.decomposition_permutations])
+        text_valid = ~text_attention_mask
+        text_pool = (text_feats * text_valid.unsqueeze(-1)).sum(1) / text_valid.sum(1, keepdim=True).clamp(min=1)
+        if self.enable_reject_head:
+            reject_input = torch.cat([vis_pool, text_pool], dim=1)
+            reject_prob = self.reject_head(reject_input).sigmoid().squeeze(-1)
+        else:
+            reject_prob = None
         bbox_pred, cls_pred, point = self._forward_single(out)
         results = self._get_bboxes([bbox_pred], [cls_pred], [point], img_metas)
+        if self.enable_reject_head:
+            gated = []
+            for i, (boxes, scores, labels) in enumerate(results):
+                if reject_prob[i] < self.reject_thresh:
+                    empty_boxes = img_metas[i]['box_type_3d'](
+                        scores.new_zeros((0, 6)), box_dim=6, with_yaw=False, origin=(.5, .5, .5))
+                    empty_scores = scores.new_zeros((0,))
+                    empty_labels = labels.new_zeros((0,), dtype=torch.long)
+                    gated.append((empty_boxes, empty_scores, empty_labels))
+                else:
+                    gated.append((boxes, scores, labels))
+            results = gated
         head_time = time.time() - start_time
-        return results, head_time
+        return results, head_time, reject_prob
 
 class TR3DAssigner:
     def __init__(self, top_pts_threshold, label2level):

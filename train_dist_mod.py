@@ -66,7 +66,8 @@ class TrainTester(BaseTrainTester):
                 butd=args.butd,
                 butd_gt=args.butd_gt,
                 butd_cls=args.butd_cls,
-                augment_det=args.augment_det
+                augment_det=args.augment_det,
+                mixed_json=args.mixed_train_json
             )
         
         test_dataset = Joint3DDataset(
@@ -81,7 +82,8 @@ class TrainTester(BaseTrainTester):
             butd=args.butd,
             butd_gt=args.butd_gt,
             butd_cls=args.butd_cls,
-            wo_obj_name=args.wo_obj_name
+            wo_obj_name=args.wo_obj_name,
+            mixed_json=args.mixed_val_json
         )
         return train_dataset, test_dataset
 
@@ -110,8 +112,22 @@ class TrainTester(BaseTrainTester):
             pointnet_ckpt=args.pp_checkpoint,
             data_path = args.data_root,
             self_attend=args.self_attend,
-            voxel_size = args.voxel_size
+            voxel_size = args.voxel_size,
+            enable_reject_head=args.enable_reject_head,
+            reject_thresh=args.reject_thresh
         )
+        if args.freeze_stage == 'A':
+            for name, param in model.named_parameters():
+                if ('reject' in name) or ('text_projector' in name):
+                    param.requires_grad = True
+                else:
+                    param.requires_grad = False
+        elif args.freeze_stage == 'B':
+            for name, param in model.named_parameters():
+                if any(k in name for k in ['bbox', 'center', 'size', 'sem_cls']) and 'reject' not in name:
+                    param.requires_grad = False
+                else:
+                    param.requires_grad = True
         return model
 
     # BRIEF input data.
@@ -121,7 +137,8 @@ class TrainTester(BaseTrainTester):
         return {
             'point_clouds': batch_data['point_clouds'].float(), # ([B, 50000, 6]) xyz + colour
             'text': batch_data['utterances'],                   # list[B]  text
-            'target_cat': batch_data['target_cat']
+            'target_cat': batch_data['target_cat'],
+            'is_negative': batch_data.get('is_negative')
         }
 
 
@@ -154,7 +171,11 @@ class TrainTester(BaseTrainTester):
         )
 
         # NOTE Main eval branch
-        test_loader = tqdm(test_loader)
+        test_loader = tqdm(
+            test_loader,
+            disable=(dist.is_initialized() and dist.get_rank() != 0),
+            dynamic_ncols=True,
+        )
         inf_speeds, vis_back_speeds, text_back_speeds, fuiosn_speeds, head_speeds = [],[],[],[],[]
         for batch_idx, batch_data in enumerate(test_loader):
             # note forward and compute loss
@@ -249,7 +270,11 @@ class TrainTester(BaseTrainTester):
             25, 27, 29, 31, 32, 34, 36, 38, 39, 41, 42, 44, 45
         ])  # 18 token span
 
-        test_loader = tqdm(test_loader)
+        test_loader = tqdm(
+            test_loader,
+            disable=(dist.is_initialized() and dist.get_rank() != 0),
+            dynamic_ncols=True,
+        )
         for batch_idx, batch_data in enumerate(test_loader):
             # note eval
             stat_dict, end_points = self._main_eval_branch(

@@ -75,6 +75,14 @@ def parse_option():
     parser.add_argument('--augment_det', action='store_true')
     parser.add_argument('--num_workers', type=int, default=16)
 
+    parser.add_argument('--mixed_train_json', default=None)
+    parser.add_argument('--mixed_val_json', default=None)
+    parser.add_argument('--enable_reject_head', action='store_true')
+    parser.add_argument('--reject_thresh', type=float, default=0.6)
+    parser.add_argument('--reject_loss_w', type=float, default=1.0)
+    parser.add_argument('--pos_reject_loss_w', type=float, default=0.1)
+    parser.add_argument('--freeze_stage', type=str, default='C', choices=['A', 'B', 'C'])
+
     # Training
     parser.add_argument('--start_epoch', type=int, default=1)
     parser.add_argument('--max_epoch', type=int, default=400)
@@ -229,21 +237,22 @@ class BaseTrainTester:
             train_loader = None
         else:
             train_sampler = DistributedSampler(train_dataset)
-            train_loader = DataLoader(
-                train_dataset,
+            train_loader_kwargs = dict(
                 batch_size=args.batch_size,
-                shuffle=False,      # TODO 
+                shuffle=False,      # TODO
                 num_workers=args.num_workers,
                 worker_init_fn=seed_worker,
                 pin_memory=True,
                 sampler=train_sampler,
                 drop_last=True,
-                generator=g
+                generator=g,
             )
+            if args.num_workers > 0:
+                train_loader_kwargs.update(dict(persistent_workers=True, prefetch_factor=4))
+            train_loader = DataLoader(train_dataset, **train_loader_kwargs)
         
         test_sampler = DistributedSampler(test_dataset, shuffle=False)
-        test_loader = DataLoader(
-            test_dataset,
+        test_loader_kwargs = dict(
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=args.num_workers,
@@ -251,8 +260,11 @@ class BaseTrainTester:
             pin_memory=True,
             sampler=test_sampler,
             drop_last=False,
-            generator=g
+            generator=g,
         )
+        if args.num_workers > 0:
+            test_loader_kwargs.update(dict(persistent_workers=True, prefetch_factor=4))
+        test_loader = DataLoader(test_dataset, **test_loader_kwargs)
         return train_loader, test_loader
 
     @staticmethod
@@ -269,7 +281,9 @@ class BaseTrainTester:
             losses.append('contrastive_align')
         set_criterion = SetCriterion(
             matcher=matcher,
-            losses=losses, eos_coef=0.1, temperature=0.07
+            losses=losses, eos_coef=0.1, temperature=0.07,
+            reject_loss_w=args.reject_loss_w,
+            pos_reject_loss_w=args.pos_reject_loss_w
         )
         criterion = compute_hungarian_loss
 
@@ -283,7 +297,7 @@ class BaseTrainTester:
                 "params": [
                     p for n, p in model.named_parameters()
                     if "keep_trans" not in n and "text_encoder" not in n
-                    and "select" not in n and p.requires_grad
+                    and "select" not in n and "reject" not in n and p.requires_grad
                 ]
             },
             {
@@ -306,6 +320,13 @@ class BaseTrainTester:
                     if "select" in n and p.requires_grad
                 ],
                 "lr": args.box_select_lr
+            },
+            {
+                "params": [
+                    p for n, p in model.named_parameters()
+                    if "reject" in n and p.requires_grad
+                ],
+                "lr": args.lr * 2
             }
         ]
         optimizer = optim.AdamW(param_dicts,
@@ -350,8 +371,10 @@ class BaseTrainTester:
 
         # note Distributed Data-Parallel Training (DDP)
         model = DistributedDataParallel(
-            model, device_ids=[args.local_rank],
-            broadcast_buffers=False  , find_unused_parameters=False
+            model,
+            device_ids=[args.local_rank],
+            broadcast_buffers=False,
+            find_unused_parameters=True,
         )
 
         # Check for a checkpoint
@@ -434,7 +457,8 @@ class BaseTrainTester:
         return {
             'point_clouds': batch_data['point_clouds'].float(),
             'text': batch_data['utterances'],
-            'target_cat': batch_data['target_cat']
+            'target_cat': batch_data['target_cat'],
+            'is_negative': batch_data.get('is_negative')
         }
         
     @staticmethod
@@ -463,7 +487,8 @@ class BaseTrainTester:
         return {
             'point_clouds': batch_data['point_clouds'].float(),
             'text': batch_data['utterances'],
-            'target':target
+            'target':target,
+            'is_negative': batch_data.get('is_negative')
         }
 
     @staticmethod
@@ -503,15 +528,33 @@ class BaseTrainTester:
         model.train()  # set model to training mode
 
         # Loop over batches
-        train_loader = tqdm(train_loader)
+        pbar = tqdm(
+            total=len(train_loader),
+            disable=(dist.is_initialized() and dist.get_rank() != 0),
+            dynamic_ncols=True,
+            miniters=1,
+            mininterval=0.1,
+        )
         for batch_idx, batch_data in enumerate(train_loader):
             gt_bboxes_3d, gt_labels_3d, gt_all_bbox_new, auxi_bbox, img_metas = get_gt(batch_data)
+
+            pbar.set_postfix_str("data→gpu")
+            pbar.refresh()
+
             # Move to GPU
             batch_data = self._to_gpu(batch_data)
             # get the input data: pointcloud and text
             inputs = self._get_inputs(batch_data)
-            
-            losses = model(inputs, gt_bboxes_3d, gt_labels_3d, gt_all_bbox_new, auxi_bbox, img_metas, epoch)
+
+            losses = model(
+                inputs,
+                gt_bboxes_3d,
+                gt_labels_3d,
+                gt_all_bbox_new,
+                auxi_bbox,
+                img_metas,
+                epoch,
+            )
             loss = losses['loss']
 
             optimizer.zero_grad()
@@ -529,17 +572,24 @@ class BaseTrainTester:
             # Accumulate statistics and print out
             stat_dict = self._accumulate_stats(stat_dict, losses)
 
+            pbar.set_postfix(
+                loss=float(loss), lr=optimizer.param_groups[0]["lr"]
+            )
+            pbar.update(1)
+
             # print loss
             if (batch_idx + 1) % args.print_freq == 0:
                 # Terminal logs
                 self.logger.info(
-                    f'Train: [{epoch}][{batch_idx + 1}/{len(train_loader)}]  '  # Train: [30][2000/2432]
+                    f'Train: [{epoch}][{batch_idx + 1}/{len(train_loader)}]  '
                 )
                 self.logger.info(''.join([
                     f'{key} {stat_dict[key] / (batch_idx + 1):.4f} \t'
                     for key in sorted(stat_dict.keys())
                     if 'loss' in key
-                ])) # loss，loss_bbox，loss_ce，loss_sem_align，loss_giou，query_points_generation_loss
+                ]))
+
+        pbar.close()
 
 
     # BRIEF eval 

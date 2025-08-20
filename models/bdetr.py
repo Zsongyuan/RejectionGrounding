@@ -23,7 +23,8 @@ class BeaUTyDETR(nn.Module):
                  num_decoder_layers=6, self_position_embedding='loc_learned',
                  contrastive_align_loss=True,
                  d_model=128, butd=True, pointnet_ckpt=None, data_path=None,
-                 self_attend=True, voxel_size=0.01):
+                 self_attend=True, voxel_size=0.01,
+                 enable_reject_head=False, reject_thresh=0.6):
         """Initialize layers."""
         super().__init__()
 
@@ -33,9 +34,12 @@ class BeaUTyDETR(nn.Module):
         self.contrastive_align_loss = contrastive_align_loss
         self.butd = butd
         self.voxel_size = voxel_size
+        self.enable_reject_head = enable_reject_head
 
         # Visual encoder
-        self.vision_backbone = TSPBackbone(in_channels=6)
+        self.input_feature_dim = input_feature_dim
+        self.vision_backbone = TSPBackbone(
+            in_channels=3 + self.input_feature_dim)
         
         # Text encoder
         t_type = f'{data_path}roberta-base/'
@@ -52,7 +56,9 @@ class BeaUTyDETR(nn.Module):
         )       
         
         # self.neck = TR3DNeck()
-        self.head = TSPHead(voxel_size=self.voxel_size)
+        self.head = TSPHead(voxel_size=self.voxel_size,
+                             enable_reject_head=enable_reject_head,
+                             reject_thresh=reject_thresh)
         
     
     # BRIEF forward.
@@ -72,7 +78,9 @@ class BeaUTyDETR(nn.Module):
         start_time = time.time()
         coordinates, features = ME.utils.batch_sparse_collate(
                 [(p[:, :3] / self.voxel_size, p[:, 0:] if p.shape[1] > 3 else p[:, :3]) for p in points],
-                device=points[0].device)        
+                device=points[0].device)
+        assert features.shape[1] == self.vision_backbone.conv1.in_channels, \
+            f"Input feature dim {features.shape[1]} mismatches backbone requirement {self.vision_backbone.conv1.in_channels}"
         x = ME.SparseTensor(coordinates=coordinates, features=features)
         x = self.vision_backbone(x)
         visual_time = time.time() - start_time
@@ -92,7 +100,7 @@ class BeaUTyDETR(nn.Module):
         
         if not self.training:
             start_time = time.time()
-            bbox_list, head_time = self.head.forward_test(x, text_feats, text_attention_mask, img_metas)
+            bbox_list, head_time, _ = self.head.forward_test(x, text_feats, text_attention_mask, img_metas)
             bbox_results = [
                 bbox3d2result(bboxes, scores, labels)
                 for bboxes, scores, labels in bbox_list
@@ -100,6 +108,8 @@ class BeaUTyDETR(nn.Module):
             fusion_time = time.time() - start_time
             return bbox_results, {'loss':0.}, 0., [visual_time,text_time,fusion_time-head_time,head_time]
         losses = self.head.forward_train(x,text_feats, text_attention_mask, gt_bboxes, gt_labels, gt_all_bbox_new, auxi_bbox, img_metas)
+        if 'is_negative' in inputs:
+            losses['is_negative'] = inputs['is_negative']
         losses.update({'loss':sum(value for key, value in losses.items() if '_loss' in key)})
         return losses
     def init_bn_momentum(self):

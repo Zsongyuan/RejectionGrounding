@@ -64,6 +64,8 @@ class GroundingEvaluator:
         self.gts.update({'vd50': 1e-14, 'vid50': 1e-14})
         self.gts.update({'hard50': 1e-14, 'easy50': 1e-14})
         self.gts.update({'multi50': 1e-14, 'unique50': 1e-14})
+        self.neg_total = 0
+        self.neg_reject_correct = 0
 
     def print_stats(self):
         """Print accumulated accuracies."""
@@ -92,6 +94,7 @@ class GroundingEvaluator:
         print('iou@0.50')
         for field in ['easy50', 'hard50', 'vd50', 'vid50', 'unique50', 'multi50']:
             print(field, self.dets[field] / self.gts[field])
+        print('Reject@Neg =', self.neg_reject_correct / max(1, self.neg_total))
 
     def synchronize_between_processes(self):
         all_dets = misc.all_gather(self.dets)
@@ -138,6 +141,11 @@ class GroundingEvaluator:
 
         # Highest scoring box -> iou
         for bid in range(len(end_points['bbox_results'])):
+            if end_points.get('is_negative') is not None and bool(end_points['is_negative'][bid]):
+                self.neg_total += 1
+                if end_points['bbox_results'][bid]['bboxes_3d'].tensor.shape[0] == 0:
+                    self.neg_reject_correct += 1
+                continue
             num_obj = 1
             gt_bboxes = end_points['gt_bboxes_3d'][bid]
             gt_bboxes = torch.cat([gt_bboxes.gravity_center, gt_bboxes.dims], dim=1)

@@ -50,7 +50,7 @@ class Joint3DDataset(Dataset):
                  use_color=False, use_height=False, use_multiview=False,
                  detect_intermediate=False,
                  butd=False, butd_gt=False, butd_cls=False, augment_det=False,
-                 wo_obj_name="None"):
+                 wo_obj_name="None", mixed_json=None):
         """Initialize dataset (here for ReferIt3D utterances)."""
         self.dataset_dict = dataset_dict
         self.test_dataset = test_dataset
@@ -74,6 +74,8 @@ class Joint3DDataset(Dataset):
         )
         self.augment_det = augment_det
         self.wo_obj_name = wo_obj_name
+        # optional path to mixed positive/negative json annotations
+        self.mixed_json = mixed_json
 
         self.mean_rgb = np.array([109.8, 97.2, 83.8]) / 256
         
@@ -201,8 +203,7 @@ class Joint3DDataset(Dataset):
                 str(line[headers['mentions_target_class']]).lower() == 'true'
             ]
 
-            # text decoupling
-            Scene_graph_parse(annos)
+            # text decoupling moved to __getitem__ for lazy parsing
 
         return annos
 
@@ -238,7 +239,7 @@ class Joint3DDataset(Dataset):
                 )
             ]
         
-        Scene_graph_parse(annos)
+        # text decoupling moved to __getitem__ for lazy parsing
 
         # Add distractor info
         for anno in annos:
@@ -267,8 +268,12 @@ class Joint3DDataset(Dataset):
             split = 'val'
         with open(_path + '_%s.txt' % split) as f:  # ScanRefer_filtered_train.txt
             scan_ids = [line.rstrip().strip('\n') for line in f.readlines()]
-        with open(_path + '_%s.json' % split) as f:
-            reader = json.load(f)
+        if self.mixed_json is not None:
+            with open(self.mixed_json) as f:
+                reader = json.load(f)
+        else:
+            with open(_path + '_%s.json' % split) as f:
+                reader = json.load(f)
         if self.wo_obj_name != "None":
             with open(self.wo_obj_name) as f:
                 reader = json.load(f)
@@ -285,7 +290,8 @@ class Joint3DDataset(Dataset):
                 'anchors': [],      
                 'anchor_ids': [],   
                 'dataset': 'scanrefer',
-                'target_cat': self.raw2label[' '.join(str(anno['object_name']).split('_'))] if ' '.join(str(anno['object_name']).split('_')) in self.raw2label else 17
+                'target_cat': self.raw2label[' '.join(str(anno['object_name']).split('_'))] if ' '.join(str(anno['object_name']).split('_')) in self.raw2label else 17,
+                'is_negative': anno.get('is_negative', False)
             }
             for anno in reader
             if anno['scene_id'] in scan_ids
@@ -294,7 +300,7 @@ class Joint3DDataset(Dataset):
         ###########################
         # STEP 2. text decoupling #
         ###########################
-        Scene_graph_parse(annos)
+        # postponed to __getitem__ for lazy parsing
 
         # # NOTE BUTD-DETR unreasonable approach, add GT object name
         # num = 0
@@ -883,8 +889,12 @@ class Joint3DDataset(Dataset):
 
         # step Read annotation and point clouds
         anno = self.annos[index]
+        if anno['dataset'] != 'scannet' and 'graph_node' not in anno:
+            # lazily parse text annotations to reduce startup time
+            Scene_graph_parse([anno])
         scan = self.scans[anno['scan_id']]
         scan.pc = np.copy(scan.orig_pc)
+        is_negative = bool(anno.get('is_negative', False))
 
         # step constract anno (used only for [scannet])
         self.random_utt = False
@@ -938,8 +948,13 @@ class Joint3DDataset(Dataset):
         point_cloud, augmentations, og_color = self._get_pc(anno, scan)
 
         # step "Target" boxes: append anchors if they're to be detected
-        gt_bboxes, box_label_mask, point_instance_label = \
-            self._get_target_boxes(anno, scan)
+        if is_negative:
+            gt_bboxes = np.zeros((MAX_NUM_OBJ, 6))
+            box_label_mask = np.zeros(MAX_NUM_OBJ)
+            point_instance_label = -np.ones(len(scan.pc))
+        else:
+            gt_bboxes, box_label_mask, point_instance_label = \
+                self._get_target_boxes(anno, scan)
 
         # step Scene gt boxes
         (
@@ -959,6 +974,14 @@ class Joint3DDataset(Dataset):
             # note text parsing
             tokens_positive, positive_map, modify_positive_map, pron_positive_map, \
                 other_entity_map, auxi_entity_positive_map, rel_positive_map = self._get_token_positive_map_by_parse(anno, auxi_box)
+        if is_negative:
+            positive_map = np.zeros_like(positive_map)
+            modify_positive_map = np.zeros_like(modify_positive_map)
+            pron_positive_map = np.zeros_like(pron_positive_map)
+            other_entity_map = np.zeros_like(other_entity_map)
+            auxi_entity_positive_map = np.zeros_like(auxi_entity_positive_map)
+            rel_positive_map = np.zeros_like(rel_positive_map)
+            tokens_positive = np.zeros_like(tokens_positive)
         if auxi_box is None:
             auxi_box = np.zeros((1, 6))
         else:
@@ -1057,7 +1080,8 @@ class Joint3DDataset(Dataset):
                 class_ids[anno['target_id']]
                 if isinstance(anno['target_id'], int)
                 else class_ids[anno['target_id'][0]]
-            )
+            ),
+            "is_negative": np.array(is_negative, dtype=np.int64)
         })
 
         return ret_dict
