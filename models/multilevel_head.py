@@ -706,10 +706,10 @@ class TSPHead(nn.Module):
                              gt_bboxes, gt_labels, img_metas, keep_preds, keep_gts, bboxes_level,
                              com_pred_training, com_coords_training)
         if self.enable_reject_head:
-            reject_feat = torch.cat([vis_pool, text_pool], dim=1)
-            reject_logit = self.reject_head(reject_feat)
-            losses['reject_logit'] = reject_logit
-            losses['reject_prob'] = reject_logit.sigmoid()
+            keep_feat = torch.cat([vis_pool, text_pool], dim=1)
+            keep_logit = self.reject_head(keep_feat)
+            losses['keep_logit'] = keep_logit
+            losses['keep_prob'] = keep_logit.sigmoid()
         return losses
 
 
@@ -944,16 +944,17 @@ class TSPHead(nn.Module):
         text_valid = ~text_attention_mask
         text_pool = (text_feats * text_valid.unsqueeze(-1)).sum(1) / text_valid.sum(1, keepdim=True).clamp(min=1)
         if self.enable_reject_head:
-            reject_input = torch.cat([vis_pool, text_pool], dim=1)
-            reject_prob = self.reject_head(reject_input).sigmoid().squeeze(-1)
+            keep_input = torch.cat([vis_pool, text_pool], dim=1)
+            keep_prob = self.reject_head(keep_input).sigmoid().squeeze(-1)
         else:
-            reject_prob = None
+            keep_prob = None
         bbox_pred, cls_pred, point = self._forward_single(out)
         results = self._get_bboxes([bbox_pred], [cls_pred], [point], img_metas)
-        if self.enable_reject_head:
+        if self.enable_reject_head and self.reject_thresh >= 0:
             gated = []
+            reject_prob = 1 - keep_prob
             for i, (boxes, scores, labels) in enumerate(results):
-                if reject_prob[i] < self.reject_thresh:
+                if reject_prob[i] >= self.reject_thresh:
                     empty_boxes = img_metas[i]['box_type_3d'](
                         scores.new_zeros((0, 6)), box_dim=6, with_yaw=False, origin=(.5, .5, .5))
                     empty_scores = scores.new_zeros((0,))
@@ -963,7 +964,7 @@ class TSPHead(nn.Module):
                     gated.append((boxes, scores, labels))
             results = gated
         head_time = time.time() - start_time
-        return results, head_time, reject_prob
+        return results, head_time, keep_prob
 
 class TR3DAssigner:
     def __init__(self, top_pts_threshold, label2level):

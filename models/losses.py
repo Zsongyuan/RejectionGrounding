@@ -573,7 +573,7 @@ class SetCriterion(nn.Module):
         return {"loss_sem_align": tot_loss / num_boxes}
 
     def loss_reject(self, outputs, targets, indices=None, num_boxes=None, auxi_indices=None):
-        logits = outputs['reject_logit'].squeeze(-1)
+        logits = outputs['keep_logit'].squeeze(-1)
         is_negative = outputs['is_negative'].float()
         y = 1.0 - is_negative
         weights = torch.ones_like(y)
@@ -745,12 +745,12 @@ def compute_hungarian_loss(end_points, num_decoder_layers, set_criterion,
         )
     )
 
-    if 'reject_logit' in end_points:
-        reject_output = {
-            'reject_logit': end_points['reject_logit'].squeeze(-1),
+    if 'keep_logit' in end_points:
+        keep_output = {
+            'keep_logit': end_points['keep_logit'].squeeze(-1),
             'is_negative': is_negative.float()
         }
-        reject_losses = set_criterion.loss_reject(reject_output, None)
+        reject_losses = set_criterion.loss_reject(keep_output, None)
         end_points.update(reject_losses)
         loss = loss + set_criterion.reject_loss_w * reject_losses['loss_reject']
 
