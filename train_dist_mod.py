@@ -206,11 +206,30 @@ class TrainTester(BaseTrainTester):
                 for t in evaluator.thresholds:
                     self.logger.info(''.join([
                         f"{'3dcnn'} Acc{t:.2f}: ", f"Top-{1}: {evaluator.dets[('3dcnn', t, 1, 'bbf')] / max(evaluator.gts[('3dcnn', t, 1, 'bbf')], 1):.5f}"
-                    ]))           
+                    ]))
 
-        print('inf: ', np.array(inf_speeds).mean(),'vis_back_speeds: ', np.array(vis_back_speeds).mean(),
-              'text_back_speeds: ', np.array(text_back_speeds).mean(),'fuiosn_speeds: ', np.array(fuiosn_speeds).mean(),
-              'head_speeds: ', np.array(head_speeds).mean())
+        mean_inf = np.array(inf_speeds).mean()
+        mean_vis = np.array(vis_back_speeds).mean()
+        mean_text = np.array(text_back_speeds).mean()
+        mean_fusion = np.array(fuiosn_speeds).mean()
+        mean_head = np.array(head_speeds).mean()
+        print('inf: ', mean_inf,'vis_back_speeds: ', mean_vis,
+              'text_back_speeds: ', mean_text,'fuiosn_speeds: ', mean_fusion,
+              'head_speeds: ', mean_head)
+        if hasattr(self, 'tensorboard') and getattr(self.tensorboard, 'tensorboard_writer', None) and dist.get_rank() == 0:
+            tb = self.tensorboard.tensorboard_writer['val']
+            acc025 = evaluator.dets[('3dcnn', 0.25, 1, 'bbf')] / max(evaluator.gts[('3dcnn', 0.25, 1, 'bbf')], 1)
+            acc050 = evaluator.dets[('3dcnn', 0.5, 1, 'bbf')] / max(evaluator.gts[('3dcnn', 0.5, 1, 'bbf')], 1)
+            tb.add_scalar('val/acc@0.25', acc025, epoch)
+            tb.add_scalar('val/acc@0.50', acc050, epoch)
+            tb.add_scalar('val/reject@neg', evaluator.neg_reject_correct / max(1, evaluator.neg_total), epoch)
+            if 'loss' in stat_dict:
+                tb.add_scalar('val/loss_total', stat_dict['loss'] / len(test_loader), epoch)
+            tb.add_scalar('val/inf_speed', mean_inf, epoch)
+            tb.add_scalar('val/vis_back_speed', mean_vis, epoch)
+            tb.add_scalar('val/text_back_speed', mean_text, epoch)
+            tb.add_scalar('val/fusion_speed', mean_fusion, epoch)
+            tb.add_scalar('val/head_speed', mean_head, epoch)
 
         return None
        

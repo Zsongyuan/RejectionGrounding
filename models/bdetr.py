@@ -100,17 +100,60 @@ class BeaUTyDETR(nn.Module):
         
         if not self.training:
             start_time = time.time()
-            bbox_list, head_time, _ = self.head.forward_test(x, text_feats, text_attention_mask, img_metas)
+            bbox_list, head_time, keep_prob = self.head.forward_test(
+                x, text_feats, text_attention_mask, img_metas
+            )
             bbox_results = [
                 bbox3d2result(bboxes, scores, labels)
                 for bboxes, scores, labels in bbox_list
             ]
             fusion_time = time.time() - start_time
-            return bbox_results, {'loss':0.}, 0., [visual_time,text_time,fusion_time-head_time,head_time]
-        losses = self.head.forward_train(x,text_feats, text_attention_mask, gt_bboxes, gt_labels, gt_all_bbox_new, auxi_bbox, img_metas)
+            losses = {'loss': 0.0}
+            if keep_prob is not None:
+                losses['keep_prob'] = keep_prob
+            if inputs.get('compute_val_loss', False):
+                with torch.no_grad():
+                    val_losses = self.head.forward_train(
+                        x, text_feats, text_attention_mask,
+                        gt_bboxes, gt_labels, gt_all_bbox_new, auxi_bbox, img_metas
+                    )
+                if self.enable_reject_head and 'keep_logit' in val_losses and 'is_negative' in inputs:
+                    keep_logit = val_losses.pop('keep_logit')
+                    target = 1 - inputs['is_negative'].float()
+                    val_losses['loss_reject'] = F.binary_cross_entropy_with_logits(
+                        keep_logit.squeeze(-1), target
+                    )
+                if 'is_negative' in inputs:
+                    val_losses['is_negative'] = inputs['is_negative'].float()
+                val_losses.update({
+                    'loss': sum(
+                        value for key, value in val_losses.items()
+                        if key != 'loss' and 'loss' in key
+                    )
+                })
+                if keep_prob is not None:
+                    val_losses['keep_prob'] = keep_prob
+                losses = val_losses
+            return bbox_results, losses, 0., [visual_time, text_time, fusion_time - head_time, head_time]
+
+        losses = self.head.forward_train(
+            x, text_feats, text_attention_mask,
+            gt_bboxes, gt_labels, gt_all_bbox_new, auxi_bbox, img_metas
+        )
+        if self.enable_reject_head and 'keep_logit' in losses and 'is_negative' in inputs:
+            keep_logit = losses.pop('keep_logit')
+            target = 1 - inputs['is_negative'].float()
+            losses['loss_reject'] = F.binary_cross_entropy_with_logits(
+                keep_logit.squeeze(-1), target
+            )
         if 'is_negative' in inputs:
-            losses['is_negative'] = inputs['is_negative']
-        losses.update({'loss':sum(value for key, value in losses.items() if '_loss' in key)})
+            losses['is_negative'] = inputs['is_negative'].float()
+        losses.update({
+            'loss': sum(
+                value for key, value in losses.items()
+                if key != 'loss' and 'loss' in key
+            )
+        })
         return losses
     def init_bn_momentum(self):
         """Initialize batch-norm momentum."""
