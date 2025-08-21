@@ -811,6 +811,8 @@ class TSPHead(nn.Module):
         x = inputs[-1]
         bbox_preds, cls_preds, points = [], [], []
         keep_scores = None
+        # ensure out is defined even if the loop breaks early
+        out = None
         
         for i in range(len(inputs) - 1, -1, -1):
             if i ==1:
@@ -938,8 +940,27 @@ class TSPHead(nn.Module):
             x = self.__getattr__(f'lateral_block_{i}')(x)
             if i == 0:
                 out = self.__getattr__(f'out_block_{i}')(x)
+
         start_time = time.time()
-        out = self.fuse(out, text_feats[:, 0])
+
+        if out is None:
+            device = text_feats.device if text_feats is not None else torch.device('cpu')
+            empty_results = []
+            for meta in img_metas:
+                empty_boxes = meta['box_type_3d'](
+                    torch.zeros((0, 6), device=device),
+                    box_dim=6,
+                    with_yaw=False,
+                    origin=(.5, .5, .5),
+                )
+                empty_scores = torch.zeros((0,), device=device)
+                empty_labels = torch.zeros((0,), dtype=torch.long, device=device)
+                empty_results.append((empty_boxes, empty_scores, empty_labels))
+            head_time = time.time() - start_time
+            return empty_results, head_time, None
+
+        if getattr(self, 'fuse', None) is not None and text_feats is not None:
+            out = self.fuse(out, text_feats[:, 0])
         vis_pool = torch.stack([out.features[perm].mean(0) for perm in out.decomposition_permutations])
         text_valid = ~text_attention_mask
         text_pool = (text_feats * text_valid.unsqueeze(-1)).sum(1) / text_valid.sum(1, keepdim=True).clamp(min=1)
