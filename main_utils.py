@@ -136,24 +136,32 @@ def parse_option():
 # BRIEF load checkpoint.
 def load_checkpoint(args, model, optimizer, scheduler):
     """Load from checkpoint."""
-    print("=> loading checkpoint '{}'".format(args.checkpoint_path))
+    print(f"=> loading checkpoint '{args.checkpoint_path}'")
 
-    checkpoint = torch.load(args.checkpoint_path, map_location='cpu')
+    checkpoint = torch.load(args.checkpoint_path, map_location='cpu', weights_only=True)
+    # 1) 取出 state_dict；兼容 {'model': ...} 或直接是 state_dict
+    state = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
+    # 2) 可选：去掉 DDP 前缀
+    if any(k.startswith('module.') for k in state.keys()):
+        state = {k.replace('module.', '', 1): v for k, v in state.items()}
+
+    # 3) 预训练（无 epoch）与继续训练（有 epoch）分流
+    epoch_str = checkpoint['epoch'] if (isinstance(checkpoint, dict) and 'epoch' in checkpoint) else 'pretrain'
     try:
-        args.start_epoch = int(checkpoint['epoch']) + 1
+        args.start_epoch = int(checkpoint.get('epoch', 0)) + 1
     except Exception:
-        args.start_epoch = 0
-    model.load_state_dict(checkpoint['model'], strict=False)
+        args.start_epoch = 1  # 从 1 开始跑 Phase A
+    model.load_state_dict(state, strict=False)
     # if not args.eval and not args.reduce_lr:
     #     optimizer.load_state_dict(checkpoint['optimizer'])
     #     scheduler.load_state_dict(checkpoint['scheduler'])
 
-    print("=> loaded successfully '{}' (epoch {})".format(
-        args.checkpoint_path, checkpoint['epoch']
-    ))
+    print(f"=> loaded successfully '{args.checkpoint_path}' (epoch {epoch_str})")
 
+    del state
     del checkpoint
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 # BRIEF save model.
@@ -571,6 +579,23 @@ class BaseTrainTester:
 
             # Accumulate statistics and print out
             stat_dict = self._accumulate_stats(stat_dict, losses)
+            if hasattr(self, 'tensorboard') and getattr(self.tensorboard, 'tensorboard_writer', None):
+                step = epoch * len(train_loader) + batch_idx
+                tb = self.tensorboard.tensorboard_writer['train']
+                tb.add_scalar('train/loss_total', losses['loss'], step)
+                tb.add_scalar('train/loss_bbox', losses.get('bbox_loss', 0.0), step)
+                tb.add_scalar('train/loss_cls', losses.get('cls_loss', 0.0), step)
+                tb.add_scalar('train/loss_com', losses.get('com_loss', 0.0), step)
+                tb.add_scalar('train/loss_keep', losses.get('keep_loss', 0.0), step)
+                if 'loss_reject' in losses:
+                    tb.add_scalar('train/loss_reject', losses['loss_reject'], step)
+                if 'keep_prob' in losses:
+                    tb.add_scalar('train/keep_prob_mean', losses['keep_prob'].mean(), step)
+                if 'is_negative' in losses:
+                    tb.add_scalar('train/neg_ratio', losses['is_negative'].float().mean(), step)
+                lr_names = ['lr_base', 'lr_text', 'lr_trans', 'lr_select']
+                for lr, name in zip([pg['lr'] for pg in optimizer.param_groups], lr_names):
+                    tb.add_scalar(f'train/{name}', lr, step)
 
             pbar.set_postfix(
                 loss=float(loss), lr=optimizer.param_groups[0]["lr"]
@@ -602,6 +627,7 @@ class BaseTrainTester:
         batch_data = self._to_gpu(batch_data)
         # inputs = self._get_inputs_contra(batch_data)
         inputs = self._get_inputs(batch_data)
+        inputs['compute_val_loss'] = True
         if "train" not in inputs:
             inputs.update({"train": False})
         else:
@@ -621,6 +647,21 @@ class BaseTrainTester:
             end_points[key] = batch_data[key]
 
         stat_dict = self._accumulate_stats(stat_dict, losses)
+        if hasattr(self, 'tensorboard') and getattr(self.tensorboard, 'tensorboard_writer', None):
+            tb = self.tensorboard.tensorboard_writer['val']
+            if 'loss' in losses:
+                tb.add_scalar('val/loss_batch', losses['loss'], batch_idx)
+            if 'keep_prob' in losses:
+                keep_prob = losses['keep_prob']
+                tb.add_histogram('val/keep_prob_hist', keep_prob, batch_idx)
+                is_neg = losses.get('is_negative')
+                if is_neg is not None:
+                    pos_mask = ~is_neg.bool()
+                    neg_mask = is_neg.bool()
+                    if pos_mask.any():
+                        tb.add_scalar('val/keep_prob_pos_mean', keep_prob[pos_mask].mean(), batch_idx)
+                    if neg_mask.any():
+                        tb.add_scalar('val/keep_prob_neg_mean', keep_prob[neg_mask].mean(), batch_idx)
         if (batch_idx + 1) % args.print_freq == 0:
             self.logger.info(f'Eval: [{batch_idx + 1}/{len(test_loader)}]  ')
             self.logger.info(''.join([
