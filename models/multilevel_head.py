@@ -827,7 +827,6 @@ class TSPHead(nn.Module):
                                               coordinate_manager=x.coordinate_manager)
                     x = x + x_level
                 else:
-                    pdb.set_trace()
                     break
             elif i ==0:
                 x = self._prune_inference(x, prune_inference,i)
@@ -841,7 +840,6 @@ class TSPHead(nn.Module):
                                               coordinate_manager=x.coordinate_manager)
                     x_ori = x + x_level
                 else:
-                    # pdb.set_trace()
                     break
         
                 sampled_coords,sampled_features, original_indices = [],[],[]
