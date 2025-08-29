@@ -260,22 +260,45 @@ class Joint3DDataset(Dataset):
     
     # BRIEF load ScanRefer
     def load_scanrefer_annos(self):
-        """Load annotations of ScanRefer."""
+        """Load annotations of ScanRefer (支持 mixed_json 主导 split)."""
+        from collections import defaultdict
+        import os, json
+        import numpy as np
+
+        # 映射（保持与原实现一致）
         self.raw2label = self._get_raw2label()
-        _path = self.data_path + 'ScanRefer/ScanRefer_filtered'
+
+        # 规范化路径拼接
+        base_dir = os.path.join(self.data_path, 'ScanRefer', 'ScanRefer_filtered')
         split = self.split
         if split in ('val', 'test'):
             split = 'val'
-        with open(_path + '_%s.txt' % split) as f:  # ScanRefer_filtered_train.txt
-            scan_ids = [line.rstrip().strip('\n') for line in f.readlines()]
+
+        # ---------- 读取 JSON / split 列表 ----------
+        reader = None
+        scan_ids = None
+
+        # 优先使用 mixed_json（或 wo_obj_name）定义样本 + split
         if self.mixed_json is not None:
-            with open(self.mixed_json) as f:
+            with open(self.mixed_json, 'r') as f:
                 reader = json.load(f)
-        else:
-            with open(_path + '_%s.json' % split) as f:
-                reader = json.load(f)
+            # 由 JSON 自身给出 split（不再读 txt 做二次筛）
+            scan_ids = {a['scene_id'] for a in reader}
+
+        # 可选：使用 wo_obj_name 覆盖 reader（若提供）
         if self.wo_obj_name != "None":
-            with open(self.wo_obj_name) as f:
+            with open(self.wo_obj_name, 'r') as f:
+                reader = json.load(f)
+            # 由该 JSON 再次定义 split
+            scan_ids = {a['scene_id'] for a in reader}
+
+        # 若没有提供 mixed_json/wo_obj_name，则走原始 split（txt+json）
+        if reader is None:
+            txt_path = f"{base_dir}_{split}.txt"    # ScanRefer_filtered_train/val.txt
+            json_path = f"{base_dir}_{split}.json"  # ScanRefer_filtered_train/val.json
+            with open(txt_path, 'r') as f:
+                scan_ids = {line.rstrip().strip('\n') for line in f.readlines()}
+            with open(json_path, 'r') as f:
                 reader = json.load(f)
         
         # STEP 1. load utterance
