@@ -158,7 +158,7 @@ class GroundingEvaluator:
                     # 这里最安全：continue（后续统计已涵盖“无候选=未命中”）
                     continue
                 k = min(5, scores.numel())
-                _, top = torch.topk(scores, 5)
+                _, top = torch.topk(scores, k)
                 pbox = bboxes[top]
                 top = top.reshape(1,-1)
                 gt_bboxes = end_points['gt_bboxes_3d'][bid]
