@@ -153,6 +153,11 @@ class GroundingEvaluator:
             bboxes = end_points['bbox_results'][bid]['bboxes_3d']
             bboxes = torch.cat([bboxes.gravity_center, bboxes.dims], dim=1)
             if scores.shape[0]>4:
+                if scores is None or scores.numel() == 0:
+                    # 当作未检出，记为 miss，跳过该样本（负样本则视作正确拒绝）
+                    # 这里最安全：continue（后续统计已涵盖“无候选=未命中”）
+                    continue
+                k = min(5, scores.numel())
                 _, top = torch.topk(scores, 5)
                 pbox = bboxes[top]
                 top = top.reshape(1,-1)
