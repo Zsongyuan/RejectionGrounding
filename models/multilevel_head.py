@@ -71,7 +71,7 @@ class TSPHead(nn.Module):
                  prune_threshold=(0.3,0.7),
                  com_threshold = 0.15,
                  train_cfg=None,
-                 test_cfg=dict(nms_pre=1, iou_thr=.5, score_thr=.01),
+                 test_cfg=dict(nms_pre=600, iou_thr=.25, score_thr=.0),
                  keep_loss_weight = 1.0,
                  bbox_loss_weight = 1.0,
                  enable_reject_head=False,
