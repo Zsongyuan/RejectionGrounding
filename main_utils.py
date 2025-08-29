@@ -151,15 +151,22 @@ def load_checkpoint(args, model, optimizer, scheduler):
         args.start_epoch = int(checkpoint.get('epoch', 0)) + 1
     except Exception:
         args.start_epoch = 1  # 从 1 开始跑 Phase A
+
     model.load_state_dict(state, strict=False)
     # if not args.eval and not args.reduce_lr:
     #     optimizer.load_state_dict(checkpoint['optimizer'])
     #     scheduler.load_state_dict(checkpoint['scheduler'])
-    missing, unexpected = model.load_state_dict(state, strict=False)
+    # 统一拿到“里层”模型
+    to_load = model.module if hasattr(model, "module") else model
+
+    # （建议）先把 ckpt 的 'module.' 前缀去掉，避免双份前缀
+    state_dict = checkpoint.get("model", checkpoint)
+    if any(k.startswith("module.") for k in state_dict.keys()):
+        state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+
+    missing, unexpected = to_load.load_state_dict(state_dict, strict=False)
     if dist.get_rank() == 0:
         print(f"[ckpt] missing={len(missing)} unexpected={len(unexpected)}")
-
-
     print(f"=> loaded successfully '{args.checkpoint_path}' (epoch {epoch_str})")
 
     del state
