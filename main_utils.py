@@ -155,6 +155,10 @@ def load_checkpoint(args, model, optimizer, scheduler):
     # if not args.eval and not args.reduce_lr:
     #     optimizer.load_state_dict(checkpoint['optimizer'])
     #     scheduler.load_state_dict(checkpoint['scheduler'])
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if dist.get_rank() == 0:
+        print(f"[ckpt] missing={len(missing)} unexpected={len(unexpected)}")
+
 
     print(f"=> loaded successfully '{args.checkpoint_path}' (epoch {epoch_str})")
 
