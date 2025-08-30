@@ -157,8 +157,9 @@ class GroundingEvaluator:
                     # 当作未检出，记为 miss，跳过该样本（负样本则视作正确拒绝）
                     # 这里最安全：continue（后续统计已涵盖“无候选=未命中”）
                     continue
+                scores = scores.view(-1)                 # 统一成 (N,)
                 k = min(5, scores.numel())
-                _, top = torch.topk(scores, k)
+                _, top = torch.topk(scores, k, dim=0) 
                 pbox = bboxes[top]
                 top = top.reshape(1,-1)
                 gt_bboxes = end_points['gt_bboxes_3d'][bid]
