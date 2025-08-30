@@ -136,68 +136,116 @@ def parse_option():
 
 # BRIEF load checkpoint.
 def load_checkpoint(args, model, optimizer=None, scheduler=None):
-    """Safely load checkpoints on PyTorch 2.6:
-       - Accepts weights-only dicts: {'model': state_dict, 'epoch': int} or pure state_dict
-       - Strips DDP 'module.' prefixes
-       - Does NOT assume optimizer/scheduler exist (weights_only)
+    """Robust loader for PyTorch 2.6:
+       1) Try weights_only=True
+       2) If fails due to unsupported globals (e.g., argparse.Namespace), allowlist them and retry
+       3) If still fails and TRUST_CHECKPOINT=1, fallback to weights_only=False (trusted only)
+       Supports: {'model': state_dict, 'epoch': int} or pure state_dict
     """
     path = getattr(args, "checkpoint_path", None)
-    if path is None:
+    if not path:
         raise ValueError("args.checkpoint_path is None")
 
-    print(f"=> loading checkpoint '{path}'")
+    # rank-0 print helper
+    is_rank0 = (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+    def rprint(*msg):
+        if is_rank0:
+            print(*msg)
 
-    # 1) Safe load (PyTorch 2.6). If running on older Torch where weights_only isn't supported,
-    #    fall back to a regular load (TypeError branch).
+    rprint(f"=> loading checkpoint '{path}'")
+
+    def _add_safe_allowlist():
+        # Best-effort allowlist of commonly seen globals in checkpoints
+        try:
+            from torch.serialization import add_safe_globals
+        except Exception:
+            add_safe_globals = None
+
+        objs = []
+        try:
+            import argparse
+            objs.append(argparse.Namespace)
+        except Exception:
+            pass
+        try:
+            import pathlib
+            if hasattr(pathlib, "PosixPath"):
+                objs.append(pathlib.PosixPath)
+            if hasattr(pathlib, "WindowsPath"):
+                objs.append(pathlib.WindowsPath)
+        except Exception:
+            pass
+        try:
+            from types import SimpleNamespace
+            objs.append(SimpleNamespace)
+        except Exception:
+            pass
+
+        if add_safe_globals and objs:
+            try:
+                add_safe_globals(objs)
+                return True
+            except Exception:
+                return False
+        return False
+
+    # ---- 1) First attempt: strict weights_only=True
+    loaded_weights_only = True
     try:
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-        loaded_weights_only = True
-    except TypeError:
-        # weights_only kw not supported (older torch) — best-effort fallback
-        checkpoint = torch.load(path, map_location="cpu")
-        loaded_weights_only = False
-    except Exception as e:
-        raise RuntimeError(f"Failed to load checkpoint '{path}': {e}")
+    except Exception as e1:
+        # ---- 2) Second attempt: still weights_only=True but allowlist common globals
+        allowlisted = _add_safe_allowlist()
+        try:
+            if allowlisted:
+                checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+            else:
+                raise e1
+        except Exception as e2:
+            # ---- 3) Final attempt: ONLY if user explicitly trusts the file
+            trust_env = os.getenv("TRUST_CHECKPOINT", "0") == "1"
+            trust_flag = getattr(args, "trust_checkpoint", False)
+            if trust_env or trust_flag:
+                rprint("[ckpt] weights_only load failed; TRUST_CHECKPOINT enabled -> trying weights_only=False")
+                try:
+                    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+                    loaded_weights_only = False
+                except Exception as e3:
+                    raise RuntimeError(f"Failed to load checkpoint '{path}' (unsafe fallback also failed): {e3}")
+            else:
+                hint = ("Set env TRUST_CHECKPOINT=1 (if you trust this file) "
+                        "or ensure the checkpoint is weights-only {'model': state_dict, 'epoch': int}.")
+                raise RuntimeError(f"Failed to load checkpoint '{path}' with weights_only=True: {e2}\n{hint}")
 
-    # 2) Normalize into (state_dict, epoch)
-    state_dict = None
-    epoch = None
-
+    # ---- Normalize to (state_dict, epoch)
     if isinstance(checkpoint, (dict, OrderedDict)) and "model" in checkpoint and isinstance(checkpoint["model"], (dict, OrderedDict)):
-        # Common case: {'model': state_dict, 'epoch': int, ...}
         state_dict = checkpoint["model"]
-        if "epoch" in checkpoint:
-            try:
-                epoch = int(checkpoint["epoch"])
-            except Exception:
-                epoch = None
+        epoch = checkpoint.get("epoch", None)
     elif isinstance(checkpoint, (dict, OrderedDict)) and all(isinstance(v, torch.Tensor) for v in checkpoint.values()):
-        # Pure state_dict (string->Tensor)
         state_dict = checkpoint
         epoch = None
     elif isinstance(checkpoint, OrderedDict):
-        # Some save pure OrderedDict
         state_dict = checkpoint
         epoch = None
     else:
-        raise ValueError(
-            "Unsupported checkpoint format. Expected {'model': state_dict, ...} or a pure state_dict."
-        )
+        raise ValueError("Unsupported checkpoint format. Expect {'model': state_dict, ...} or a pure state_dict.")
 
-    # 3) Strip possible DDP prefixes
+    # strip possible DDP prefix
     if any(k.startswith("module.") for k in state_dict.keys()):
         state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
 
-    # 4) Load into model (handle DDP-wrapped models)
+    # load into (possibly DDP-wrapped) model
     to_load = model.module if hasattr(model, "module") else model
     missing, unexpected = to_load.load_state_dict(state_dict, strict=False)
 
-    # 5) Epoch bookkeeping: start from next epoch if available; otherwise start Phase A at 1
-    start_epoch = (int(epoch) + 1) if (epoch is not None) else 1
-    setattr(args, "start_epoch", start_epoch)
+    # epoch bookkeeping
+    try:
+        args.start_epoch = int(epoch) + 1 if epoch is not None else 1
+    except Exception:
+        args.start_epoch = 1
 
-    # 6) Optimizer/Scheduler: typically absent under weights_only — load only if present and allowed
-    if not getattr(args, "eval", False) and not loaded_weights_only:
+    # optimizer/scheduler: only if they exist in checkpoint AND we loaded unsafely (rare)
+    if not getattr(args, "eval", False) and (not loaded_weights_only):
         if isinstance(checkpoint, dict) and "optimizer" in checkpoint and optimizer is not None:
             try:
                 optimizer.load_state_dict(checkpoint["optimizer"])
@@ -209,20 +257,17 @@ def load_checkpoint(args, model, optimizer=None, scheduler=None):
             except Exception:
                 pass
 
-    # 7) Logging (rank-0 only if DDP)
-    is_rank0 = (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
     if is_rank0:
-        print(f"[ckpt] loaded: '{path}' "
-              f"(epoch={epoch if epoch is not None else 'pretrain'}, "
-              f"weights_only={loaded_weights_only})")
-        print(f"[ckpt] missing={len(missing)} unexpected={len(unexpected)}")
+        rprint(f"[ckpt] loaded: '{path}' (epoch={epoch if epoch is not None else 'pretrain'}, "
+               f"weights_only={loaded_weights_only})")
+        rprint(f"[ckpt] missing={len(missing)} unexpected={len(unexpected)}")
         if missing:
-            print("        missing_keys(example):", missing[:5])
+            rprint("        missing_keys(example):", missing[:5])
         if unexpected:
-            print("        unexpected_keys(example):", unexpected[:5])
+            rprint("        unexpected_keys(example):", unexpected[:5])
 
-    # 8) Cleanup
-    del checkpoint, state_dict
+    # cleanup
+    del checkpoint
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
