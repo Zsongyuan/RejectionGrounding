@@ -23,6 +23,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
+from collections import OrderedDict
 
 from models import HungarianMatcher, SetCriterion, compute_hungarian_loss
 from utils import get_scheduler, setup_logger
@@ -134,43 +135,94 @@ def parse_option():
     return args
 
 # BRIEF load checkpoint.
-def load_checkpoint(args, model, optimizer, scheduler):
-    """Load from checkpoint."""
-    print(f"=> loading checkpoint '{args.checkpoint_path}'")
+def load_checkpoint(args, model, optimizer=None, scheduler=None):
+    """Safely load checkpoints on PyTorch 2.6:
+       - Accepts weights-only dicts: {'model': state_dict, 'epoch': int} or pure state_dict
+       - Strips DDP 'module.' prefixes
+       - Does NOT assume optimizer/scheduler exist (weights_only)
+    """
+    path = getattr(args, "checkpoint_path", None)
+    if path is None:
+        raise ValueError("args.checkpoint_path is None")
 
-    checkpoint = torch.load(args.checkpoint_path, map_location='cpu', weights_only=True)
-    # 1) 取出 state_dict；兼容 {'model': ...} 或直接是 state_dict
-    state = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
-    # 2) 可选：去掉 DDP 前缀
-    if any(k.startswith('module.') for k in state.keys()):
-        state = {k.replace('module.', '', 1): v for k, v in state.items()}
+    print(f"=> loading checkpoint '{path}'")
 
-    # 3) 预训练（无 epoch）与继续训练（有 epoch）分流
-    epoch_str = checkpoint['epoch'] if (isinstance(checkpoint, dict) and 'epoch' in checkpoint) else 'pretrain'
+    # 1) Safe load (PyTorch 2.6). If running on older Torch where weights_only isn't supported,
+    #    fall back to a regular load (TypeError branch).
     try:
-        args.start_epoch = int(checkpoint.get('epoch', 0)) + 1
-    except Exception:
-        args.start_epoch = 1  # 从 1 开始跑 Phase A
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        loaded_weights_only = True
+    except TypeError:
+        # weights_only kw not supported (older torch) — best-effort fallback
+        checkpoint = torch.load(path, map_location="cpu")
+        loaded_weights_only = False
+    except Exception as e:
+        raise RuntimeError(f"Failed to load checkpoint '{path}': {e}")
 
-    model.load_state_dict(state, strict=False)
-    # if not args.eval and not args.reduce_lr:
-    #     optimizer.load_state_dict(checkpoint['optimizer'])
-    #     scheduler.load_state_dict(checkpoint['scheduler'])
-    # 统一拿到“里层”模型
-    to_load = model.module if hasattr(model, "module") else model
+    # 2) Normalize into (state_dict, epoch)
+    state_dict = None
+    epoch = None
 
-    # （建议）先把 ckpt 的 'module.' 前缀去掉，避免双份前缀
-    state_dict = checkpoint.get("model", checkpoint)
+    if isinstance(checkpoint, (dict, OrderedDict)) and "model" in checkpoint and isinstance(checkpoint["model"], (dict, OrderedDict)):
+        # Common case: {'model': state_dict, 'epoch': int, ...}
+        state_dict = checkpoint["model"]
+        if "epoch" in checkpoint:
+            try:
+                epoch = int(checkpoint["epoch"])
+            except Exception:
+                epoch = None
+    elif isinstance(checkpoint, (dict, OrderedDict)) and all(isinstance(v, torch.Tensor) for v in checkpoint.values()):
+        # Pure state_dict (string->Tensor)
+        state_dict = checkpoint
+        epoch = None
+    elif isinstance(checkpoint, OrderedDict):
+        # Some save pure OrderedDict
+        state_dict = checkpoint
+        epoch = None
+    else:
+        raise ValueError(
+            "Unsupported checkpoint format. Expected {'model': state_dict, ...} or a pure state_dict."
+        )
+
+    # 3) Strip possible DDP prefixes
     if any(k.startswith("module.") for k in state_dict.keys()):
         state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
 
+    # 4) Load into model (handle DDP-wrapped models)
+    to_load = model.module if hasattr(model, "module") else model
     missing, unexpected = to_load.load_state_dict(state_dict, strict=False)
-    if dist.get_rank() == 0:
-        print(f"[ckpt] missing={len(missing)} unexpected={len(unexpected)}")
-    print(f"=> loaded successfully '{args.checkpoint_path}' (epoch {epoch_str})")
 
-    del state
-    del checkpoint
+    # 5) Epoch bookkeeping: start from next epoch if available; otherwise start Phase A at 1
+    start_epoch = (int(epoch) + 1) if (epoch is not None) else 1
+    setattr(args, "start_epoch", start_epoch)
+
+    # 6) Optimizer/Scheduler: typically absent under weights_only — load only if present and allowed
+    if not getattr(args, "eval", False) and not loaded_weights_only:
+        if isinstance(checkpoint, dict) and "optimizer" in checkpoint and optimizer is not None:
+            try:
+                optimizer.load_state_dict(checkpoint["optimizer"])
+            except Exception:
+                pass
+        if isinstance(checkpoint, dict) and "scheduler" in checkpoint and scheduler is not None:
+            try:
+                scheduler.load_state_dict(checkpoint["scheduler"])
+            except Exception:
+                pass
+
+    # 7) Logging (rank-0 only if DDP)
+    is_rank0 = (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+    if is_rank0:
+        print(f"[ckpt] loaded: '{path}' "
+              f"(epoch={epoch if epoch is not None else 'pretrain'}, "
+              f"weights_only={loaded_weights_only})")
+        print(f"[ckpt] missing={len(missing)} unexpected={len(unexpected)}")
+        if missing:
+            print("        missing_keys(example):", missing[:5])
+        if unexpected:
+            print("        unexpected_keys(example):", unexpected[:5])
+
+    # 8) Cleanup
+    del checkpoint, state_dict
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
